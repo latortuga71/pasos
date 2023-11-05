@@ -10,13 +10,112 @@
 #include <string>
 #include <fstream>
 
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int PrintUsage(char* argvzero) {
+	// add args here
+	fprintf(stderr, "Usage: %s\n", argvzero);
+	fprintf(stderr, "    --target\n");
+	fprintf(stderr, "        Absolute path to target binary to fuzz. \n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "    --corpus\n");
+	fprintf(stderr, "        Initial corpus of files to mutuate. \n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "    --mutate\n");
+	fprintf(stderr, "        Name of file mutation.\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "    --rounds\n");
+	fprintf(stderr, "        Fuzz iterations to execute.\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "    --seed\n");
+	fprintf(stderr, "        Seed for PRNG.\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "    --functions\n");
+	fprintf(stderr, "        Path to functions to use for code coverage.\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "    --min-mutations\n");
+	fprintf(stderr, "        Mininum amount of mutations per sample.\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "    --max-mutations\n");
+	fprintf(stderr, "        Maximum amount of mutations per sample.\n");
+	fprintf(stderr, "\n");
+	return 1;
+}
+
+BOOL FIRST_RUN = TRUE;
+
+static int POWER_OF_TWO[8]{ 1, 2, 4, 8, 16, 32, 64, 128 };
+
+static int MAGIC_VALS[10][4] = {
+	{0xFF},
+	{0x7F},
+	{0x00},
+	{0xFF, 0xFF},
+	{0x00, 0x00},
+	{0xFF, 0xFF, 0xFF, 0xFF},
+	{0x00, 0x00, 0x00, 0x00},
+	{0x00, 0x00, 0x00, 0x80},
+	{0x00, 0x00, 0x00, 0x40},
+	{0xFF, 0xFF, 0xFF, 0x7F},
+};
+
+
+// Mutation Functions
+static void MagicByte(char* data, int index) {
+	int whichMagic = rand() % (10 - 0) + 0;
+	int* magicBytes = MAGIC_VALS[whichMagic];
+	int sz = sizeof(MAGIC_VALS[whichMagic]) / sizeof(MAGIC_VALS[whichMagic][0]);
+	memcpy(data + index, magicBytes, 4);
+}
+
+// Flips A Bit
+static char BitFlip(char byte) {
+	int whichBit = rand() % (7 + 0);
+	return byte ^ POWER_OF_TWO[whichBit];
+}
+
+// Flips A Byte
+static char ByteFlip(char byte) {
+	char randomByte = rand();
+	return byte ^ randomByte;
+}
+
+// NULL
+static char InsertNull(char byte) {
+	return 0;
+}
+
+// Random Byte Between 0 - 255
+static char InsertRandomByte(char byte) {
+	return rand()  % (255 + 0);
+}
+
+
+/// 
 BYTE SetBreakpoint(HANDLE hProc, UINT64 address);
 DWORD RemoveBreakpoint(HANDLE hProc, UINT64 address, BYTE originalByte);
 UINT64 GetBaseAddress(HANDLE hProc, const wchar_t* moduleName);
 HMODULE GetProcessModule(HANDLE hProc, const wchar_t* exeName);
 
+DWORD LoadInitialBreakPointOffsets(const char* file, HANDLE hProc);
 
-DWORD LoadBreakPointOffsets(const char* file,HANDLE hProc) {
+DWORD LoadBreakPoints(HANDLE hProc) {
+	DWORD counter = 0;
+	FuzzerDB.BreakpointsMutex.lock();
+	for (BreakPoint &bp: FuzzerDB.Breakpoints) {
+		if (bp.Hit == FALSE) {
+			SetBreakpoint(hProc, bp.Address);
+			//fprintf(stderr, "[+] Set BreakPoint 0x%p\n", bp.Address);
+			counter++;
+		}
+	}
+	FuzzerDB.BreakpointsMutex.unlock();
+	return counter;
+}
+DWORD LoadInitialBreakPointOffsets(const char* file,HANDLE hProc) {
 	DWORD attributes = GetFileAttributesA(file);
 	if (attributes == INVALID_FILE_ATTRIBUTES) {
 		fprintf(stderr, "LoadBreakPointOffsets::GetFileAttributes Error File Doesnt Exist Or Is Directory");
@@ -47,16 +146,19 @@ DWORD LoadBreakPointOffsets(const char* file,HANDLE hProc) {
 		BYTE OriginalValue = SetBreakpoint(hProc, b.Address);
 		if (OriginalValue == NULL) {
 			fprintf(stderr, "LoadBreakPointOffsets::SetBreakpoint Error Value To Get Original Value\n");
-			exit(-1);
+			//exit(-1);
+			continue;
 		}
 		b.OriginalByte = OriginalValue;
+		FuzzerDB.BreakpointsMutex.lock();
 		FuzzerDB.Breakpoints.push_back(b);
+		FuzzerDB.BreakpointsMutex.unlock();
 		fprintf(stderr, "[+] Set BreakPoint 0x%p\n", b.Address);
 		c++;
 	}
 	fprintf(stderr, "[+] Set %d Breakpoints\n",c);
 	FuzzerDB.CoverageData.TotalBreakPoints = c;
-	return 0;
+	return c;
 }
 
 void PrintCorpus() {
@@ -143,23 +245,24 @@ BOOL HandleExceptionEvent(HANDLE hProc,DEBUG_EVENT* dbEvent) {
 	{
 	case EXCEPTION_ACCESS_VIOLATION:
 		fprintf(stderr, "[!!!] HolyShit A Crash? At 0x%llx\n",breakAddress);
+		FuzzerDB.CrashesCount++;
 		// First chance: Pass this on to the system. 
 		// Last chance: Display an appropriate error. 
 		break;
 
 	case EXCEPTION_BREAKPOINT:
 		// Loop over currently active breakpoints.
+		FuzzerDB.BreakpointsMutex.lock();
 		for (BreakPoint &bp : FuzzerDB.Breakpoints) {
 			if ((bp.Address == breakAddress) && (bp.Hit == FALSE)) {
-				fprintf(stderr, "We Hit Our BreakPoint! 0x%p\n",bp.Address);
+				//fprintf(stderr, "We Hit Our BreakPoint! 0x%p\n",bp.Address);
 				if (RemoveBreakpoint(hProc, bp.Address, bp.OriginalByte) != 0) {
 					fprintf(stderr, "HandleExceptionEvent::RemoveBreakpoint Error %d\n", GetLastError());
 					exit(GetLastError());
 				}				
-				fprintf(stderr, "Removed BreakPoint! 0x%p\n", bp.Address);
+				//fprintf(stderr, "Removed BreakPoint! 0x%p\n", bp.Address);
 				bp.Hit = TRUE;
 				FuzzerDB.CoverageData.HitCount++;
-				
 				HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, dbEvent->dwThreadId);
 				if (hThread == INVALID_HANDLE_VALUE){
 					fprintf(stderr, "Failed to get thread handle\n");
@@ -171,11 +274,11 @@ BOOL HandleExceptionEvent(HANDLE hProc,DEBUG_EVENT* dbEvent) {
 					fprintf(stderr, "Failed to get thread context\n");
 					exit(-1);
 				}
-				fprintf(stderr, "RIP: 0x%llx\n", ctx.Rip);
+				//fprintf(stderr, "RIP: 0x%llx\n", ctx.Rip);
 				DWORD64 oldRip = ctx.Rip;
 				oldRip -= 1;
 				ctx.Rip = oldRip;
-				fprintf(stderr, "Rewinding Rip\n");
+				//fprintf(stderr, "Rewinding Rip\n");
 				if (!SetThreadContext(hThread, &ctx)) {
 					fprintf(stderr, "Failed to get set thread context\n");
 					exit(-1);
@@ -185,10 +288,12 @@ BOOL HandleExceptionEvent(HANDLE hProc,DEBUG_EVENT* dbEvent) {
 					fprintf(stderr, "Failed to get thread context\n");
 					exit(-1);
 				}
-				fprintf(stderr, "RIP: 0x%llx\n", ctx.Rip);
+				//fprintf(stderr, "RIP: 0x%llx\n", ctx.Rip);
+				FuzzerDB.BreakpointsMutex.unlock();
 				return TRUE; 				// Return True Because We Handled It.
 			}
 		}
+		FuzzerDB.BreakpointsMutex.unlock();
 		fprintf(stderr, "[!] We Hit A BreakPoint We Did Not Set??? 0x%llx\n",breakAddress);
 		return TRUE;
 
@@ -209,7 +314,9 @@ BOOL HandleExceptionEvent(HANDLE hProc,DEBUG_EVENT* dbEvent) {
 		// First chance: Pass this on to the system. 
 		// Last chance: Display an appropriate error. 
 		break;
-
+	case 0x406d1388:
+		//fprintf(stderr, "Thread Name Exception\n");
+		break;
 	default:
 		fprintf(stderr, "Err ??? 0x%x At 0x%llx\n", dbEvent->u.Exception.ExceptionRecord.ExceptionCode,breakAddress);
 		// Handle other exceptions. 
@@ -223,16 +330,24 @@ struct StopProc {
 };
 
 void TerminateProcessThread(StopProc proc) {
-	Sleep(5000);
-	printf("Terminating Debugged Process\n");
-	DebugActiveProcessStop(proc.pid);
-	//TerminateProcess(proc.hProc,0);
+	if (FIRST_RUN) {
+		Sleep(10000);
+		DebugActiveProcessStop(proc.pid);
+		TerminateProcess(proc.hProc, 0);
+		FIRST_RUN = FALSE;
+	}
+	else {
+		Sleep(250);
+		DebugActiveProcessStop(proc.pid);
+		TerminateProcess(proc.hProc, 0);
+	}
+
 }
 
-DWORD CreateProcessAndAttach(const wchar_t* targetWithArgs,const wchar_t* target,const char* breakpointFile) {
+DWORD CreateProcessAndAttach(const wchar_t* targetWithArgs,const wchar_t* target,const char* breakpointFile, CorpusEntry* mutatedData) {
 	STARTUPINFOW sa = {};
 	PROCESS_INFORMATION pi = {};
-	BOOL RESULT = CreateProcessW(NULL, (LPWSTR)targetWithArgs, NULL, NULL, FALSE, DEBUG_ONLY_THIS_PROCESS | DEBUG_PROCESS | CREATE_NEW_CONSOLE, NULL, NULL, &sa, &pi);
+	BOOL RESULT = CreateProcessW(NULL, (LPWSTR)targetWithArgs, NULL, NULL, FALSE, DEBUG_PROCESS | CREATE_NEW_CONSOLE, NULL, NULL, &sa, &pi);
 	if (!RESULT) {
 		fprintf(stderr, "CreateProcessAndAttach CreateProcessA Error %d\n", GetLastError());
 		CloseHandle(pi.hProcess);
@@ -240,54 +355,80 @@ DWORD CreateProcessAndAttach(const wchar_t* targetWithArgs,const wchar_t* target
 		return -1;
 	}
 	DEBUG_EVENT dbEvent = {};
+	// Checking If we hit ntdll breakpoint to set remaining bps
 	BOOL IsFirstExceptionHit = FALSE;
+	// Checking if current mutation has been added to corpus
+	BOOL addMutatedToCorpus = FALSE;
 	StopProc p = { pi.hProcess,pi.dwProcessId };
 	HANDLE hThread = CreateThread(NULL, 1024, (LPTHREAD_START_ROUTINE)TerminateProcessThread, &p, NULL, NULL);
 	while (1) {
 		WaitForDebugEventEx(&dbEvent, INFINITE);
 		switch (dbEvent.dwDebugEventCode) {
 		case EXCEPTION_DEBUG_EVENT:
+			// If We Hit ntdll!LdrpDoDebuggerBreak Set our breakpoints and continue;
 			if (!IsFirstExceptionHit) {
-				// Do Initial Setup Get Base Address And Set BreakPoints
-				fprintf(stderr, "[+] Ntdll BreakPoint Hit! Setting Up Coverage.\n");
-				FuzzerDB.BaseAddress = GetBaseAddress(pi.hProcess, target);
-				LoadBreakPointOffsets(breakpointFile,pi.hProcess);
+				//fprintf(stderr, "[+] Ntdll BreakPoint Hit! Setting Up Coverage.\n");
+				if (FuzzerDB.BreakPointsInit) {
+					DWORD loaded = LoadBreakPoints(pi.hProcess);
+					printf("Loaded %d bps\n", loaded);
+				}
+				else {
+					// Do Initial Setup Get Base Address And Set BreakPoints
+					FuzzerDB.BaseAddress = GetBaseAddress(pi.hProcess, target);
+					DWORD loaded = LoadInitialBreakPointOffsets(breakpointFile, pi.hProcess);
+					FuzzerDB.BreakPointsInit = TRUE;
+					printf("Loaded %d bps\n", loaded);
+				}
 				IsFirstExceptionHit = TRUE;
 				ContinueDebugEvent(dbEvent.dwProcessId, dbEvent.dwThreadId, DBG_EXCEPTION_HANDLED);
 				continue;
 			}
 			if (HandleExceptionEvent(pi.hProcess,&dbEvent)){
+				if (!addMutatedToCorpus) {
+					fprintf(stderr, "[+] Added mutation to corpus.\n");
+					CorpusEntry newEntry = { 0 };
+					newEntry.Length = mutatedData->Length;
+					newEntry.Name = mutatedData->Name;
+					newEntry.Data = (BYTE*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, newEntry.Length);
+					memcpy(newEntry.Data, mutatedData->Data, newEntry.Length);
+					newEntry.Name.append(L"M");
+					FuzzerDB.CorpusMutex.lock();
+					FuzzerDB.Corpus.push_back(newEntry);
+					FuzzerDB.CorpusCount++;
+					FuzzerDB.CorpusMutex.unlock();
+					addMutatedToCorpus = TRUE;
+				}
 				ContinueDebugEvent(dbEvent.dwProcessId, dbEvent.dwThreadId, DBG_EXCEPTION_HANDLED);
-				// rewind rip?
 				continue;
 			}
 			break;
 		case CREATE_THREAD_DEBUG_EVENT:
-			fprintf(stderr, "Create Thread!\n");
+			//fprintf(stderr, "Create Thread!\n");
 			break;
 		case CREATE_PROCESS_DEBUG_EVENT:
-			fprintf(stderr, "Create Process\n");
+			//fprintf(stderr, "Create Process\n");
 			break;
 		case EXIT_THREAD_DEBUG_EVENT:
-			fprintf(stderr, "Exit Thread!\n");
+			//fprintf(stderr, "Exit Thread!\n");
 			break;
 		case EXIT_PROCESS_DEBUG_EVENT:
-			fprintf(stderr, "Exit Process!\n");
+			//fprintf(stderr, "Exit Process!\n");
+			ContinueDebugEvent(dbEvent.dwProcessId, dbEvent.dwThreadId,DBG_EXCEPTION_NOT_HANDLED);
 			return 0;
 		case LOAD_DLL_DEBUG_EVENT:
-			fprintf(stderr, "Load DLL!\n");
+			//fprintf(stderr, "Load DLL!\n");
 			break;
 		case UNLOAD_DLL_DEBUG_EVENT:
-			fprintf(stderr, "Unload DLL!\n");
+			//fprintf(stderr, "Unload DLL!\n");
 			break;
 		case OUTPUT_DEBUG_STRING_EVENT:
-			fprintf(stderr, "Debug String!\n");
+			//fprintf(stderr, "Debug String!\n");
 			break;
 		case RIP_EVENT:
-			fprintf(stderr, "RIP!\n");
+			//fprintf(stderr, "RIP!\n");
 			break;
 		default:
-			fprintf(stderr, "??!\n");
+			//fprintf(stderr, "??!\n");
 			break;
 		}
 		// DBG_CONTINUE;
@@ -390,42 +531,221 @@ void CleanUp() {
 	fprintf(stderr, "[+] Freed Corpus\n");
 }
 
-void Fuzz() {
-	// SET SEED AND TIMEOUT SECONDS FOR SEPERATE TERMIANTE PROCESS THREAD
-	// use a seed for deterministic mutations
-	// Randomly Choose Something In Corpus
-	// Mutate it
-	// Write it to disk in ./tmp directory
-	// CreateProcess With That FullPath To Mutation As Argument
-	// Breakpoints will be loaded 
-	// set timeout on process debug for x seconds
-	// if breakpoints hit move mutated on disk data to in memory corpus.
-	// when process exits repeat process
-	// to increase "speed" you have a way to fork? and create multiple instances of this thing?
+void Mutate(char* data, size_t length, int minMutate, int maxMutate) {
+	int randMax = length;
+	int randMin = 0;
+	int mutations = rand() % (maxMutate - minMutate) + minMutate;
+	//printf("Mutation Applied %d\n",mutations);
+	int methods[] = { 0,4 };
+	for (int idx = 0; idx < mutations; idx++) {
+		//int method = rand() % (4 - 0) + 0;
+		int method = 0;
+		int flipIndex = rand() % (randMax - randMin) + randMin; // where to flip the bit
+		//fprintf(stderr,"Attempting method %d at index %d\n",method,flipIndex);
+		if (method == 0) {
+			data[flipIndex] = BitFlip(data[flipIndex]);
+		}
+		else if (method == 1) {
+			data[flipIndex] = ByteFlip(data[flipIndex]);
+		}
+		else if (method == 2) {
+			MagicByte(data, flipIndex);
+		}
+		else if (method == 3) {
+			data[flipIndex] = InsertNull(data[flipIndex]);
+		}
+		else {
+			data[flipIndex] = InsertRandomByte(data[flipIndex]);
+		}
+	}
 }
 
-int main()
+void FuzzLoop(int WorkerId) {
+	// Fuzz Round
+	FuzzerDB.CorpusMutex.lock();
+	DWORD WROTE;
+	int CorpusSz = FuzzerDB.Corpus.size();
+	int WhichCorpi = rand() % (CorpusSz - 0) + 0;
+	// This copies By Default? Not Sure
+	CorpusEntry Original = FuzzerDB.Corpus[WhichCorpi];
+	CorpusEntry Mutated = { 0 };
+	Mutated.Length = Original.Length;
+	Mutated.Name = Original.Name;
+	Mutated.Data = (BYTE*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, Mutated.Length);
+	memcpy(Mutated.Data, Original.Data, Mutated.Length);
+	FuzzerDB.CorpusMutex.unlock();
+	Mutate((char*)Mutated.Data,Mutated.Length, FuzzerDB.minMutation,FuzzerDB.maxMutation);
+	wchar_t name_buffer[45];
+	swprintf_s(name_buffer, 45, L".\\corpus\\MutatedWorker_%d.bin", WorkerId);
+	HANDLE hFile = CreateFileW(name_buffer, GENERIC_ALL,NULL, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hFile == INVALID_HANDLE_VALUE) {
+		fprintf(stderr, "Failed to open file error %u\n",GetLastError());
+		exit(-1);
+	}
+	if (!WriteFile(hFile, Mutated.Data, Mutated.Length, &WROTE, NULL)) {
+		fprintf(stderr, "Failed to write mutated data to disk\n");
+		exit(-1);
+	}
+	CloseHandle(hFile);
+	// Create Process With File As Arg
+	wchar_t cmdlineBuffer[56];
+	swprintf_s(cmdlineBuffer, 56, L"sumatra .\\corpus\\MutatedWorker_%d.bin", WorkerId);
+	//LPTSTR szCmdline = _tcsdup(TEXT("notepad.exe C:\\Users\\lator\\source\\repos\\pasos\\x64\\Debug\\test.txt"));
+	CreateProcessAndAttach(cmdlineBuffer,L"sumatra.exe","C:\\Users\\lator\\Desktop\\sumatra_offsets.txt",&Mutated);
+	HeapFree(GetProcessHeap(),0,Mutated.Data);
+}
+
+void ClearDisplay(){
+	COORD coordScreen = { 0, 0 };    // home for the cursor
+	DWORD cCharsWritten;
+	CONSOLE_SCREEN_BUFFER_INFO csbi;
+	DWORD dwConSize;
+	HANDLE hConsole;
+	hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+	// Get the number of character cells in the current buffer.
+	if (!GetConsoleScreenBufferInfo(hConsole, &csbi))
+	{
+		return;
+	}
+
+	dwConSize = csbi.dwSize.X * csbi.dwSize.Y;
+
+	// Fill the entire screen with blanks.
+	if (!FillConsoleOutputCharacter(hConsole,        // Handle to console screen buffer
+		(TCHAR)' ',      // Character to write to the buffer
+		dwConSize,       // Number of cells to write
+		coordScreen,     // Coordinates of first cell
+		&cCharsWritten)) // Receive number of characters written
+	{
+		return;
+	}
+
+	// Get the current text attribute.
+	if (!GetConsoleScreenBufferInfo(hConsole, &csbi))
+	{
+		return;
+	}
+
+	// Set the buffer's attributes accordingly.
+	if (!FillConsoleOutputAttribute(hConsole,         // Handle to console screen buffer
+		csbi.wAttributes, // Character attributes to use
+		dwConSize,        // Number of cells to set attribute
+		coordScreen,      // Coordinates of first cell
+		&cCharsWritten))  // Receive number of characters written
+	{
+		return;
+	}
+
+	// Put the cursor at its home coordinates.
+	SetConsoleCursorPosition(hConsole, coordScreen);
+}
+void RenderDisplay() {
+	ClearDisplay();
+	float CoveragePercent = 100 * ((float)FuzzerDB.CoverageData.HitCount / (float)FuzzerDB.CoverageData.TotalBreakPoints);
+	printf("Corpus: %llu\n", FuzzerDB.CorpusCount);
+	printf("Cases: %llu\n", FuzzerDB.Cases);
+	printf("Coverage: %llu/%llu %% %.2f\n", FuzzerDB.CoverageData.HitCount, FuzzerDB.CoverageData.TotalBreakPoints,CoveragePercent);
+	printf("Crashes: %llu\n",FuzzerDB.CrashesCount);
+}
+
+int main(int argc,char** argv)
 {
-	//00007ff6`38dfe654 <- 00007ff6` 38df e654 notepad!AnsiWriteFile (int __cdecl AnsiWriteFile(void *,unsigned int,unsigned long,void *,unsigned long))
-	//00007ff6`3024e654	<- 00007ff6` 3024 e654 notepad!AnsiWriteFile (int __cdecl AnsiWriteFile(void *,unsigned int,unsigned long,void *,unsigned long))	
-	// 00007ff6`3024 0000 00007ff6`30278000
-	// Get Base Address = 00007ff6`30240000 Add Offsets
-	//https://learn.microsoft.com/en-us/windows/win32/debug/writing-the-debugger-s-main-loop
-	// https://www.timdbg.com/posts/writing-a-debugger-from-scratch-part-2/
-	// Load Initial Corpus Into Memory
+	char* binary = argv[0];
+	argv++;
+	// Handle Command Line Args.
+	while (*argv != NULL) {
+		if (strcmp(*argv, "--target") == 0) {
+			argv++;
+			if (*argv == NULL)
+				return PrintUsage(binary);
+			FuzzerDB.TargetBinary = std::string(*argv);
+		}
+		else if (strcmp(*argv, "--corpus") == 0) {
+			argv++;
+			if (*argv == NULL)
+				return PrintUsage(binary);
+			FuzzerDB.CorpusPath = std::string(*argv);
+		}
+		else if (strcmp(*argv, "--rounds") == 0) {
+			argv++;
+			if (*argv == NULL)
+				return PrintUsage(binary);
+			char* ptr;
+			uint64_t rounds = strtol(*argv, &ptr, 10);
+			if (rounds == 0) {
+				return PrintUsage(binary);
+			}
+			FuzzerDB.Rounds = rounds;
+		}
+		else if (strcmp(*argv, "--seed") == 0) {
+			argv++;
+			if (*argv == NULL)
+				return PrintUsage(binary);
+			char* ptr;
+			uint64_t seed = strtol(*argv, &ptr, 10);
+			if (seed == 0) {
+				return PrintUsage(binary);
+			}
+			FuzzerDB.Seed = seed;
+		}
+		/*else if (strcmp(*argv, "--functions") == 0) {
+			argv++;
+			if (*argv == NULL)
+				return PrintUsage(binary);
+			assert("TODO handle function file.");
+			GLOBAL_CONFIG.functionConfigFile = *argv;
+		}*/
+		else if (strcmp(*argv, "--min-mutation") == 0) {
+			argv++;
+			if (*argv == NULL)
+				return PrintUsage(binary);
+			char* ptr;
+			uint64_t minmuts = strtol(*argv, &ptr, 10);
+			if (minmuts == 0) {
+				return PrintUsage(binary);
+			}
+			FuzzerDB.minMutation = minmuts;
+		}
+		else if (strcmp(*argv, "--max-mutation") == 0) {
+			argv++;
+			if (*argv == NULL)
+				return PrintUsage(binary);
+			char* ptr;
+			uint64_t maxmuts = strtol(*argv, &ptr, 10);
+			if (maxmuts == 0) {
+				return PrintUsage(binary);
+			}
+			FuzzerDB.maxMutation = maxmuts;
+		}
+		else {
+			fprintf(stderr, "Error: Unknown Flag %s\n", *argv);
+			return PrintUsage(binary);
+		}
+		argv++;
+	}
     fprintf(stderr,"[+] Pasos\n");
-	LoadCorpus(L"C:\\corpus");
-	PrintCorpus();
-
-	// Create Process Debug SetBreakPoints.
-	//	LPTSTR szCmdline = _tcsdup(TEXT("notepad.exe C:\\Users\\lator\\source\\repos\\pasos\\x64\\Debug\\test.txt")); C:\Users\lator\Desktop
-	LPTSTR szCmdline = _tcsdup(TEXT("notepad.exe C:\\Users\\lator\\source\\repos\\pasos\\x64\\Debug\\test.txt"));
-	CreateProcessAndAttach(szCmdline,L"notepad.exe","C:\\Users\\lator\\Desktop\\offsets.txt");
-
-	// How Do We Fuzz Loop?
-	// CreateProcess With Mutated Data As Input
-	// 
-
+	LoadCorpus(L"C:\\corpus\\PDF");
+	srand(FuzzerDB.Seed);
+	// TODO! Setup Directories .\corpus .\out etc.
+	// First Run
+	FuzzLoop(0);
+	int workers = 2;
+	std::vector<std::thread>threads(workers);
+	while (1) {
+		FuzzLoop(0);
+		RenderDisplay();
+		/*for (int i = 0; i < workers; i++) {
+			threads[i] = std::thread(FuzzLoop, i);
+		}
+		for (auto& th : threads) {
+			th.join();
+			// wait for each thread.
+			FuzzerDB.Cases++;
+		}
+		// render display
+		RenderDisplay();
+		//break;*/
+	}
 	https://github.com/gamozolabs/mesos/blob/master/mesogen_scripts/ghidra.py fix the script
 	CleanUp();
 	return 0;
